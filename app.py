@@ -158,7 +158,10 @@ def _build_quarter_frame(df: pd.DataFrame, selected_idx: int, mode: str, side: s
     if mode == "strict":
         part = df[df["quarter_idx"] == selected_idx].copy()
     else:
+        # Carry-forward should use the latest *available* price observation,
+        # not simply the latest row by quarter (which may contain NaN price).
         part = df[df["quarter_idx"] <= selected_idx].copy()
+        part = part[part["price_per_m2"].notna()].copy()
 
     part = part.sort_values(["district_name", "quarter_idx"]).drop_duplicates(
         subset=["district_name"], keep="last"
@@ -279,7 +282,8 @@ def build_interval_snapshot(
     )
     snapshot["expected_quarters"] = snapshot["expected_quarters"].astype("Int64")
     snapshot["observed_quarters"] = snapshot["observed_quarters"].fillna(0).astype("Int64")
-    snapshot["coverage_ratio"] = snapshot["coverage_ratio"].fillna(0.0)
+    # Keep NaN when effective interval is not defined or non-positive.
+    snapshot["coverage_ratio"] = pd.to_numeric(snapshot["coverage_ratio"], errors="coerce")
     snapshot["full_coverage_flag"] = snapshot["full_coverage_flag"].fillna(False).astype(bool)
 
     growth_ratio = snapshot["current_price"] / snapshot["base_price"]
@@ -419,7 +423,11 @@ def draw_choropleth(
 
     if not reliable.empty:
         reliable["tooltip_cov"] = reliable.apply(
-            lambda r: f"{int(r['observed_quarters'])}/{int(r['expected_quarters'])}" if pd.notna(r["expected_quarters"]) else "0/0",
+            lambda r: (
+                f"{int(r['observed_quarters'])}/{int(r['expected_quarters'])}"
+                if pd.notna(r["expected_quarters"]) and r["expected_quarters"] > 0
+                else "n/a"
+            ),
             axis=1,
         )
         geojson_rel = json.loads(reliable[["join_key", "geometry"]].to_json())
