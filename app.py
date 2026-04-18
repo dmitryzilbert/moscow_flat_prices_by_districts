@@ -97,9 +97,11 @@ def resolve_geo_join_column(gdf: gpd.GeoDataFrame, panel_districts: pd.Series) -
             best_overlap = overlap
             best_col = col
 
-    if best_col is None or best_overlap <= 0:
+    min_required_overlap = max(1, int(len(panel_norm) * 0.6))
+    if best_col is None or best_overlap < min_required_overlap:
         raise ValueError(
-            "Не удалось подобрать колонку для связки GeoJSON с district_name. "
+            "Не удалось надежно подобрать колонку для связки GeoJSON с district_name. "
+            f"Максимальное пересечение: {best_overlap} из {len(panel_norm)}. "
             "Добавьте district_name в geojson или скорректируйте названия."
         )
 
@@ -172,9 +174,28 @@ def build_map_frame(snapshot: pd.DataFrame, gdf: gpd.GeoDataFrame) -> tuple[gpd.
     geo_join_col = resolve_geo_join_column(gdf, snapshot["district_name"])
     map_gdf = gdf.copy()
     map_gdf["join_key"] = _normalize_text(map_gdf[geo_join_col])
+    geo_dups = map_gdf["join_key"].duplicated(keep=False) & map_gdf["join_key"].notna()
+    if geo_dups.any():
+        dup_n = int(geo_dups.sum())
+        warnings.append(
+            f"В GeoJSON найдено {dup_n} дублирующихся join_key. "
+            "Используется первый объект для каждого ключа."
+        )
+        map_gdf = map_gdf.drop_duplicates(subset=["join_key"], keep="first")
 
     snap = snapshot.copy()
     snap["join_key"] = _normalize_text(snap["district_name"])
+    snap_dups = snap["join_key"].duplicated(keep=False) & snap["join_key"].notna()
+    if snap_dups.any():
+        dup_n = int(snap_dups.sum())
+        warnings.append(
+            f"В snapshot найдено {dup_n} дублирующихся районов после нормализации названий. "
+            "Используется строка с максимальным числом сделок."
+        )
+        snap = (
+            snap.sort_values("n_deals_current", ascending=False)
+            .drop_duplicates(subset=["join_key"], keep="first")
+        )
 
     merged = map_gdf.merge(snap, on="join_key", how="left")
     merged["district_name"] = merged["district_name"].fillna(merged[geo_join_col].astype("string"))
