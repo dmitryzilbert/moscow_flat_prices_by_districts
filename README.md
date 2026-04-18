@@ -62,3 +62,16 @@ streamlit run app.py
 
 `preprocessing.py` можно использовать для подготовки `panel.parquet` из CSV.
 Приложение v2 считает интервальные метрики **на лету** и не зависит от lag-колонок как от основной логики.
+
+
+## Smoke-test checklist (PowerShell)
+
+1. Перейти в папку проекта: `cd <путь>\moscow_flat_prices_by_districts`.
+2. Проверить чтение `panel.parquet`: `python -c "import pandas as pd; df=pd.read_parquet('panel.parquet'); print(df.shape)"`.
+3. Проверить чтение `moscow_districts.geojson`: `python -c "import json; print(len(json.load(open('moscow_districts.geojson', encoding='utf-8'))['features']))"`.
+4. Запустить приложение: `streamlit run app.py`.
+5. В UI выбрать разные пары `base quarter` / `end quarter` и убедиться, что значения пересчитываются.
+6. Выбрать метрику `CAGR` и проверить, что карта/таблицы обновляются без ошибок.
+7. Проверить, что таблицы `top` и `bottom` строятся для выбранного интервала.
+8. Выбрать конкретный район и убедиться, что график района строится.
+9. Проверить кейс отсутствия данных по району в интервале: район серый на карте, приложение не падает.
