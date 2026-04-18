@@ -57,6 +57,18 @@ def build_quarter_timestamp(df: pd.DataFrame) -> pd.Series:
     year = pd.to_numeric(df["year"], errors="coerce")
     q_num = pd.to_numeric(df["q_num"], errors="coerce")
 
+    missing_year = year.isna()
+    if missing_year.any():
+        raise ValueError(
+            f"Found {int(missing_year.sum())} rows with invalid year values; cannot build quarter timestamp."
+        )
+
+    missing_quarter = q_num.isna()
+    if missing_quarter.any():
+        raise ValueError(
+            f"Found {int(missing_quarter.sum())} rows with invalid q_num values; expected 1..4."
+        )
+
     invalid_q = ~q_num.isin([1, 2, 3, 4])
     if invalid_q.any():
         bad_vals = sorted(df.loc[invalid_q, "q_num"].dropna().unique().tolist())
@@ -94,8 +106,6 @@ def add_lag_features(df: pd.DataFrame, min_deals: int) -> pd.DataFrame:
     df["price_per_m2"] = pd.to_numeric(df["price_per_m2"], errors="coerce")
     df["n_deals"] = pd.to_numeric(df["n_deals"], errors="coerce")
 
-    grp = df.groupby("district_name", sort=False)
-
     # Current-period quality flag.
     df["enough_deals_current"] = df["n_deals"] >= min_deals
 
@@ -109,8 +119,15 @@ def add_lag_features(df: pd.DataFrame, min_deals: int) -> pd.DataFrame:
         enough_base_col = f"enough_deals_base_{lag}q"
         valid_col = f"valid_growth_observation_{lag}q"
 
-        df[lag_price_col] = grp["price_per_m2"].shift(lag)
-        df[lag_deals_col] = grp["n_deals"].shift(lag)
+        base = df[["district_name", "quarter_ts", "price_per_m2", "n_deals"]].copy()
+        base["quarter_ts"] = base["quarter_ts"] + pd.offsets.QuarterBegin(lag)
+        base = base.rename(
+            columns={
+                "price_per_m2": lag_price_col,
+                "n_deals": lag_deals_col,
+            }
+        )
+        df = df.merge(base, on=["district_name", "quarter_ts"], how="left")
 
         # Absolute change in RUB per m².
         df[abs_col] = df["price_per_m2"] - df[lag_price_col]
