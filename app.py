@@ -24,14 +24,30 @@ METRIC_OPTIONS = {
 
 
 def _normalize_text(series: pd.Series) -> pd.Series:
-    return series.astype("string").str.strip().str.lower()
+    return (
+        series.astype("string")
+        .str.strip()
+        .str.lower()
+        .str.replace("ё", "е", regex=False)
+        .str.replace(r"\s+", " ", regex=True)
+    )
 
 
 def parse_quarter(value: object) -> pd.Period | pd.NaT:
     if value is None or pd.isna(value):
         return pd.NaT
     try:
-        return pd.Period(str(value), freq="Q")
+        raw = str(value).strip().upper()
+        normalized = (
+            raw.replace(" ", "")
+            .replace("-", "")
+            .replace("/", "")
+            .replace("_", "")
+            .replace("КВ", "Q")
+        )
+        if len(normalized) >= 6 and normalized[0] == "Q" and normalized[1] in "1234":
+            normalized = f"{normalized[2:6]}Q{normalized[1]}"
+        return pd.Period(normalized, freq="Q")
     except Exception:
         return pd.NaT
 
@@ -61,11 +77,14 @@ def validate_panel(df: pd.DataFrame) -> pd.DataFrame:
     elif {"year", "q_num"}.issubset(out.columns):
         year = pd.to_numeric(out["year"], errors="coerce")
         q_num = pd.to_numeric(out["q_num"], errors="coerce")
-        out["quarter_parsed"] = pd.PeriodIndex(
-            year=year.astype("Int64"),
-            quarter=q_num.astype("Int64"),
-            freq="Q",
+        valid = year.notna() & q_num.isin([1, 2, 3, 4])
+        quarter_str = (
+            year.astype("Int64").astype("string")
+            + "Q"
+            + q_num.astype("Int64").astype("string")
         )
+        out["quarter_parsed"] = pd.Series(pd.NaT, index=out.index, dtype="period[Q-DEC]")
+        out.loc[valid, "quarter_parsed"] = quarter_str[valid].apply(parse_quarter)
     else:
         raise ValueError("Нужны либо колонка quarter, либо пара year + q_num")
 
@@ -114,6 +133,8 @@ def harmonize_district_names(gdf: gpd.GeoDataFrame, panel_districts: pd.Series) 
 
     if best_col is None:
         raise ValueError("В GeoJSON не найдено строковых колонок для join")
+    if best_overlap <= 0:
+        raise ValueError("Не найдено пересечений названий районов между panel и GeoJSON. Проверьте нейминг.")
 
     gdf_out = gdf.copy()
     gdf_out["join_key"] = _normalize_text(gdf_out[best_col])
@@ -130,6 +151,7 @@ def load_geojson(path: Path) -> gpd.GeoDataFrame:
 
 def compute_coverage(df: pd.DataFrame, base_idx: int, end_idx: int) -> pd.DataFrame:
     in_range = df[(df["quarter_idx"] >= base_idx) & (df["quarter_idx"] <= end_idx)].copy()
+    in_range = in_range[in_range["price_per_m2"].notna()].copy()
     observed = in_range.groupby("district_name", dropna=False)["quarter_idx"].nunique().rename("observed_quarters")
     coverage = observed.reset_index()
     expected = end_idx - base_idx + 1
@@ -152,7 +174,12 @@ def build_interval_snapshot(
     require_both_ends: bool,
     require_full_coverage: bool,
 ) -> tuple[pd.DataFrame, dict[str, int], int]:
-    delta_quarters = quarter_distance(base_quarter, end_quarter)
+    base_period = parse_quarter(base_quarter)
+    end_period = parse_quarter(end_quarter)
+    if pd.isna(base_period) or pd.isna(end_period):
+        raise ValueError("Не удалось распарсить базовый или конечный квартал.")
+
+    delta_quarters = int(end_period.ordinal - base_period.ordinal)
     if delta_quarters <= 0:
         raise ValueError(
             f"Некорректный интервал: базовый квартал {base_quarter}, конечный {end_quarter}. "
@@ -184,8 +211,8 @@ def build_interval_snapshot(
 
     coverage = compute_coverage(
         df=df,
-        base_idx=parse_quarter(base_quarter).ordinal,
-        end_idx=parse_quarter(end_quarter).ordinal,
+        base_idx=base_period.ordinal,
+        end_idx=end_period.ordinal,
     )
     snapshot = snapshot.merge(coverage, on="district_name", how="left")
     snapshot["expected_quarters"] = snapshot["expected_quarters"].fillna(delta_quarters + 1).astype("Int64")
@@ -212,11 +239,11 @@ def build_interval_snapshot(
 
     snapshot["passes_endpoint_filter"] = snapshot["has_data_both_ends"].astype(bool)
     if not require_both_ends:
-        snapshot["passes_endpoint_filter"] = True
+        snapshot["passes_endpoint_filter"] = pd.Series(True, index=snapshot.index, dtype=bool)
 
     snapshot["passes_coverage_filter"] = snapshot["full_coverage_flag"].astype(bool)
     if not require_full_coverage:
-        snapshot["passes_coverage_filter"] = True
+        snapshot["passes_coverage_filter"] = pd.Series(True, index=snapshot.index, dtype=bool)
 
     snapshot["has_reliable_data"] = (
         snapshot["passes_endpoint_filter"]
@@ -239,7 +266,10 @@ def build_interval_snapshot(
 
 def build_map_frame(snapshot: pd.DataFrame, gdf: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, list[str]]:
     warnings: list[str] = []
-    map_gdf, join_col = harmonize_district_names(gdf, snapshot["district_name"])
+    try:
+        map_gdf, join_col = harmonize_district_names(gdf, snapshot["district_name"])
+    except ValueError as exc:
+        raise ValueError(f"Ошибка merge panel ↔ GeoJSON: {exc}") from exc
 
     map_gdf = map_gdf.drop_duplicates(subset=["join_key"], keep="first").copy()
     snap = snapshot.drop_duplicates(subset=["join_key"], keep="first").copy()
@@ -340,7 +370,7 @@ def draw_choropleth(
                 "Сделки в базе: %{customdata[6]:.0f}<br>"
                 "Сделки в конце: %{customdata[7]:.0f}<br>"
                 "Покрытие: %{customdata[8]}<br>"
-                "coverage_ratio: %{customdata[9]:.2f}<extra></extra>"
+                "Доля покрытия: %{customdata[9]:.2f}<extra></extra>"
             )
         )
 
@@ -541,6 +571,10 @@ def main() -> None:
 
     st.subheader("Временной ряд выбранного района")
     district_options = sorted(snapshot["district_name"].dropna().unique().tolist())
+    if not district_options:
+        st.info("Нет районов для выбора в блоке временного ряда.")
+        st.caption(f"Интервал: {base_quarter} → {end_quarter} (Δ {delta_q} кварталов)")
+        return
     selected_district = st.selectbox("Район", options=district_options)
     district_row = snapshot[snapshot["district_name"] == selected_district]
     district_snapshot = district_row.iloc[0] if not district_row.empty else None
