@@ -22,6 +22,11 @@ METRIC_OPTIONS = {
     "current_price": "Цена за м² в конечном квартале",
 }
 
+QUARTER_MODE_OPTIONS = {
+    "strict": "Strict exact quarter",
+    "carry_forward": "Use last available observation up to selected quarter",
+}
+
 
 def _normalize_text(series: pd.Series) -> pd.Series:
     return (
@@ -149,19 +154,64 @@ def load_geojson(path: Path) -> gpd.GeoDataFrame:
     return gdf
 
 
-def compute_coverage(df: pd.DataFrame, base_idx: int, end_idx: int) -> pd.DataFrame:
-    in_range = df[(df["quarter_idx"] >= base_idx) & (df["quarter_idx"] <= end_idx)].copy()
-    in_range = in_range[in_range["price_per_m2"].notna()].copy()
-    observed = in_range.groupby("district_name", dropna=False)["quarter_idx"].nunique().rename("observed_quarters")
-    coverage = observed.reset_index()
-    expected = end_idx - base_idx + 1
-    coverage["expected_quarters"] = expected
-    coverage["coverage_ratio"] = np.where(
-        expected > 0,
-        coverage["observed_quarters"] / expected,
+def _build_quarter_frame(df: pd.DataFrame, selected_idx: int, mode: str, side: str) -> pd.DataFrame:
+    if mode == "strict":
+        part = df[df["quarter_idx"] == selected_idx].copy()
+    else:
+        part = df[df["quarter_idx"] <= selected_idx].copy()
+
+    part = part.sort_values(["district_name", "quarter_idx"]).drop_duplicates(
+        subset=["district_name"], keep="last"
+    )
+    return part[["district_name", "quarter_label", "quarter_idx", "price_per_m2", "n_deals"]].rename(
+        columns={
+            "quarter_label": f"effective_{side}_quarter",
+            "quarter_idx": f"effective_{side}_idx",
+            "price_per_m2": "base_price" if side == "base" else "current_price",
+            "n_deals": "base_deals" if side == "base" else "current_deals",
+        }
+    )
+
+
+def compute_effective_coverage(panel: pd.DataFrame, snapshot: pd.DataFrame) -> pd.DataFrame:
+    work = snapshot[["district_name", "effective_base_idx", "effective_end_idx"]].copy()
+    work["expected_quarters"] = np.where(
+        work["effective_base_idx"].notna() & work["effective_end_idx"].notna(),
+        (work["effective_end_idx"] - work["effective_base_idx"] + 1),
         np.nan,
     )
-    coverage["full_coverage_flag"] = (coverage["observed_quarters"] == expected).astype(bool)
+
+    observed_source = panel[panel["price_per_m2"].notna()][["district_name", "quarter_idx"]].drop_duplicates().copy()
+    obs_join = observed_source.merge(
+        work[["district_name", "effective_base_idx", "effective_end_idx"]],
+        on="district_name",
+        how="inner",
+    )
+    in_effective_range = obs_join[
+        obs_join["quarter_idx"].ge(obs_join["effective_base_idx"])
+        & obs_join["quarter_idx"].le(obs_join["effective_end_idx"])
+    ]
+    observed = (
+        in_effective_range.groupby("district_name", dropna=False)["quarter_idx"]
+        .nunique()
+        .rename("observed_quarters")
+        .reset_index()
+    )
+
+    coverage = work.merge(observed, on="district_name", how="left")
+    coverage["observed_quarters"] = coverage["observed_quarters"].fillna(0)
+    coverage["coverage_ratio"] = np.where(
+        coverage["expected_quarters"].gt(0),
+        coverage["observed_quarters"] / coverage["expected_quarters"],
+        np.nan,
+    )
+    coverage["full_coverage_flag"] = (
+        coverage["expected_quarters"].gt(0) & coverage["observed_quarters"].eq(coverage["expected_quarters"])
+    )
+
+    coverage["expected_quarters"] = coverage["expected_quarters"].astype("Int64")
+    coverage["observed_quarters"] = coverage["observed_quarters"].astype("Int64")
+    coverage["full_coverage_flag"] = coverage["full_coverage_flag"].astype(bool)
     return coverage
 
 
@@ -173,34 +223,46 @@ def build_interval_snapshot(
     min_end_deals: int,
     require_both_ends: bool,
     require_full_coverage: bool,
+    quarter_mode: str,
 ) -> tuple[pd.DataFrame, dict[str, int], int]:
     base_period = parse_quarter(base_quarter)
     end_period = parse_quarter(end_quarter)
     if pd.isna(base_period) or pd.isna(end_period):
         raise ValueError("Не удалось распарсить базовый или конечный квартал.")
 
-    delta_quarters = int(end_period.ordinal - base_period.ordinal)
-    if delta_quarters <= 0:
+    selected_delta = int(end_period.ordinal - base_period.ordinal)
+    if selected_delta <= 0:
         raise ValueError(
             f"Некорректный интервал: базовый квартал {base_quarter}, конечный {end_quarter}. "
             "Конечный квартал должен быть строго позже базового."
         )
 
-    base_frame = (
-        df[df["quarter_label"] == base_quarter][["district_name", "price_per_m2", "n_deals"]]
-        .drop_duplicates(subset=["district_name"], keep="last")
-        .rename(columns={"price_per_m2": "base_price", "n_deals": "base_deals"})
-    )
-    end_frame = (
-        df[df["quarter_label"] == end_quarter][["district_name", "price_per_m2", "n_deals"]]
-        .drop_duplicates(subset=["district_name"], keep="last")
-        .rename(columns={"price_per_m2": "current_price", "n_deals": "current_deals"})
+    base_frame = _build_quarter_frame(df, base_period.ordinal, quarter_mode, side="base")
+    end_frame = _build_quarter_frame(df, end_period.ordinal, quarter_mode, side="end")
+
+    all_districts = pd.DataFrame({"district_name": df["district_name"].dropna().unique()})
+    snapshot = all_districts.merge(base_frame, on="district_name", how="left").merge(
+        end_frame, on="district_name", how="left"
     )
 
-    snapshot = pd.merge(base_frame, end_frame, on="district_name", how="outer")
+    snapshot["selected_base_quarter"] = base_quarter
+    snapshot["selected_end_quarter"] = end_quarter
+
+    snapshot["effective_base_quarter"] = snapshot["effective_base_quarter"].astype("string")
+    snapshot["effective_end_quarter"] = snapshot["effective_end_quarter"].astype("string")
+    snapshot["effective_base_idx"] = snapshot["effective_base_idx"].astype("Int64")
+    snapshot["effective_end_idx"] = snapshot["effective_end_idx"].astype("Int64")
+
     snapshot["has_base_price"] = snapshot["base_price"].notna().astype(bool)
     snapshot["has_end_price"] = snapshot["current_price"].notna().astype(bool)
     snapshot["has_data_both_ends"] = (snapshot["has_base_price"] & snapshot["has_end_price"]).astype(bool)
+
+    snapshot["effective_delta_quarters"] = (
+        snapshot["effective_end_idx"] - snapshot["effective_base_idx"]
+    ).astype("Int64")
+    snapshot["valid_effective_interval"] = (
+        snapshot["effective_delta_quarters"].gt(0) & snapshot["has_data_both_ends"]
+    ).astype(bool)
 
     snapshot["base_deals"] = pd.to_numeric(snapshot["base_deals"], errors="coerce")
     snapshot["current_deals"] = pd.to_numeric(snapshot["current_deals"], errors="coerce")
@@ -209,13 +271,13 @@ def build_interval_snapshot(
         & snapshot["current_deals"].fillna(0).ge(min_end_deals)
     ).astype(bool)
 
-    coverage = compute_coverage(
-        df=df,
-        base_idx=base_period.ordinal,
-        end_idx=end_period.ordinal,
+    coverage = compute_effective_coverage(panel=df, snapshot=snapshot)
+    snapshot = snapshot.merge(
+        coverage[["district_name", "expected_quarters", "observed_quarters", "coverage_ratio", "full_coverage_flag"]],
+        on="district_name",
+        how="left",
     )
-    snapshot = snapshot.merge(coverage, on="district_name", how="left")
-    snapshot["expected_quarters"] = snapshot["expected_quarters"].fillna(delta_quarters + 1).astype("Int64")
+    snapshot["expected_quarters"] = snapshot["expected_quarters"].astype("Int64")
     snapshot["observed_quarters"] = snapshot["observed_quarters"].fillna(0).astype("Int64")
     snapshot["coverage_ratio"] = snapshot["coverage_ratio"].fillna(0.0)
     snapshot["full_coverage_flag"] = snapshot["full_coverage_flag"].fillna(False).astype(bool)
@@ -225,19 +287,22 @@ def build_interval_snapshot(
         snapshot["has_data_both_ends"]
         & snapshot["base_price"].gt(0)
         & snapshot["current_price"].gt(0)
+        & snapshot["effective_delta_quarters"].gt(0)
     ).astype(bool)
 
     snapshot["abs_change"] = snapshot["current_price"] - snapshot["base_price"]
     snapshot["pct_change"] = np.where(valid_growth, (growth_ratio - 1) * 100, np.nan)
     snapshot["cagr"] = np.where(
         valid_growth,
-        ((growth_ratio ** (4 / delta_quarters)) - 1) * 100,
+        ((growth_ratio ** (4 / snapshot["effective_delta_quarters"])) - 1) * 100,
         np.nan,
     )
 
     snapshot["join_key"] = _normalize_text(snapshot["district_name"])
 
-    snapshot["passes_endpoint_filter"] = snapshot["has_data_both_ends"].astype(bool)
+    snapshot["passes_endpoint_filter"] = (
+        snapshot["has_data_both_ends"] & snapshot["valid_effective_interval"]
+    ).astype(bool)
     if not require_both_ends:
         snapshot["passes_endpoint_filter"] = pd.Series(True, index=snapshot.index, dtype=bool)
 
@@ -251,7 +316,19 @@ def build_interval_snapshot(
         & snapshot["passes_coverage_filter"]
     ).astype(bool)
 
+    exact_base = df[df["quarter_idx"] == base_period.ordinal][["district_name", "price_per_m2"]]
+    exact_end = df[df["quarter_idx"] == end_period.ordinal][["district_name", "price_per_m2"]]
+    exact_pair = exact_base.merge(exact_end, on="district_name", how="inner")
+    exact_pair_count = int(
+        exact_pair[(exact_pair["price_per_m2_x"].notna()) & (exact_pair["price_per_m2_y"].notna())]["district_name"].nunique()
+    )
+
     total_districts = int(df["district_name"].nunique())
+    missing_base = int((~snapshot["has_base_price"]).sum())
+    missing_end = int((snapshot["has_base_price"] & ~snapshot["has_end_price"]).sum())
+    invalid_effective = int((snapshot["has_data_both_ends"] & ~snapshot["valid_effective_interval"]).sum())
+    with_both = int((snapshot["has_data_both_ends"] & snapshot["valid_effective_interval"]).sum())
+
     diagnostics = {
         "total_districts_panel": total_districts,
         "with_base_price": int(snapshot["has_base_price"].sum()),
@@ -259,9 +336,14 @@ def build_interval_snapshot(
         "with_both_prices": int(snapshot["has_data_both_ends"].sum()),
         "pass_min_deals": int(snapshot["passes_deals_filter"].sum()),
         "full_coverage": int(snapshot["full_coverage_flag"].sum()),
+        "exact_pair_count": exact_pair_count,
+        "carry_forward_only_pair_count": max(with_both - exact_pair_count, 0),
+        "excluded_no_data_before_base": missing_base,
+        "excluded_no_data_before_end": missing_end,
+        "excluded_nonpositive_effective_delta": invalid_effective,
     }
 
-    return snapshot, diagnostics, delta_quarters
+    return snapshot, diagnostics, selected_delta
 
 
 def build_map_frame(snapshot: pd.DataFrame, gdf: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, list[str]]:
@@ -282,6 +364,7 @@ def build_map_frame(snapshot: pd.DataFrame, gdf: gpd.GeoDataFrame) -> tuple[gpd.
         "has_data_both_ends",
         "passes_deals_filter",
         "full_coverage_flag",
+        "valid_effective_interval",
     ]
     for col in bool_cols:
         if col in merged.columns:
@@ -312,13 +395,20 @@ def draw_data_quality_summary(diag: dict[str, int], active_count: int) -> None:
     d2.metric("Полное покрытие периода", diag["full_coverage"])
     d3.metric("Участвуют в метрике", active_count)
 
+    e1, e2, e3 = st.columns(3)
+    e1.metric("Точная пара кварталов", diag["exact_pair_count"])
+    e2.metric("Пара только через carry-forward", diag["carry_forward_only_pair_count"])
+    e3.metric("Исключены: нет данных до base", diag["excluded_no_data_before_base"])
+
+    f1, f2 = st.columns(2)
+    f1.metric("Исключены: нет данных до end", diag["excluded_no_data_before_end"])
+    f2.metric("Исключены: effective end ≤ base", diag["excluded_nonpositive_effective_delta"])
+
 
 def draw_choropleth(
     map_gdf: gpd.GeoDataFrame,
     selected_metric_col: str,
     metric_label: str,
-    base_quarter: str,
-    end_quarter: str,
     show_gray_unreliable: bool,
 ) -> None:
     gdf_wgs = map_gdf.to_crs(4326)
@@ -329,7 +419,8 @@ def draw_choropleth(
 
     if not reliable.empty:
         reliable["tooltip_cov"] = reliable.apply(
-            lambda r: f"{int(r['observed_quarters'])}/{int(r['expected_quarters'])}", axis=1
+            lambda r: f"{int(r['observed_quarters'])}/{int(r['expected_quarters'])}" if pd.notna(r["expected_quarters"]) else "0/0",
+            axis=1,
         )
         geojson_rel = json.loads(reliable[["join_key", "geometry"]].to_json())
         ch = px.choropleth_mapbox(
@@ -345,6 +436,11 @@ def draw_choropleth(
             opacity=0.8,
             custom_data=[
                 "district_name",
+                "selected_base_quarter",
+                "selected_end_quarter",
+                "effective_base_quarter",
+                "effective_end_quarter",
+                "effective_delta_quarters",
                 "base_price",
                 "current_price",
                 "cagr",
@@ -352,25 +448,28 @@ def draw_choropleth(
                 "abs_change",
                 "base_deals",
                 "current_deals",
-                "tooltip_cov",
                 "coverage_ratio",
+                "tooltip_cov",
             ],
         )
         fig.add_traces(ch.data)
         fig.update_traces(
             hovertemplate=(
                 "<b>%{customdata[0]}</b><br>"
-                f"База: {base_quarter}<br>"
-                f"Конец: {end_quarter}<br>"
-                "Цена в базе: %{customdata[1]:,.0f}<br>"
-                "Цена в конце: %{customdata[2]:,.0f}<br>"
-                "CAGR: %{customdata[3]:.2f}%<br>"
-                "Рост: %{customdata[4]:.2f}%<br>"
-                "Абс. изменение: %{customdata[5]:,.0f}<br>"
-                "Сделки в базе: %{customdata[6]:.0f}<br>"
-                "Сделки в конце: %{customdata[7]:.0f}<br>"
-                "Покрытие: %{customdata[8]}<br>"
-                "Доля покрытия: %{customdata[9]:.2f}<extra></extra>"
+                "Selected base: %{customdata[1]}<br>"
+                "Selected end: %{customdata[2]}<br>"
+                "Effective base: %{customdata[3]}<br>"
+                "Effective end: %{customdata[4]}<br>"
+                "Effective delta quarters: %{customdata[5]}<br>"
+                "Цена в базе: %{customdata[6]:,.0f}<br>"
+                "Цена в конце: %{customdata[7]:,.0f}<br>"
+                "CAGR: %{customdata[8]:.2f}%<br>"
+                "Рост: %{customdata[9]:.2f}%<br>"
+                "Абс. изменение: %{customdata[10]:,.0f}<br>"
+                "Сделки в базе: %{customdata[11]:.0f}<br>"
+                "Сделки в конце: %{customdata[12]:.0f}<br>"
+                "Coverage ratio: %{customdata[13]:.2f}<br>"
+                "Покрытие (obs/exp): %{customdata[14]}<extra></extra>"
             )
         )
 
@@ -414,6 +513,11 @@ def draw_rank_tables(snapshot: pd.DataFrame, selected_metric_col: str, metric_la
 
     cols = [
         "district_name",
+        "selected_base_quarter",
+        "selected_end_quarter",
+        "effective_base_quarter",
+        "effective_end_quarter",
+        "effective_delta_quarters",
         "base_price",
         "current_price",
         "abs_change",
@@ -424,24 +528,12 @@ def draw_rank_tables(snapshot: pd.DataFrame, selected_metric_col: str, metric_la
         "coverage_ratio",
     ]
 
-    rename = {
-        "district_name": "district_name",
-        "base_price": "base_price",
-        "current_price": "current_price",
-        "abs_change": "abs_change",
-        "pct_change": "pct_change",
-        "cagr": "cagr",
-        "base_deals": "base_deals",
-        "current_deals": "current_deals",
-        "coverage_ratio": "coverage_ratio",
-    }
-
     st.subheader(f"Top / Bottom 10 по метрике: {metric_label}")
     c1, c2 = st.columns(2)
     c1.markdown("**Top-10**")
-    c1.dataframe(top[cols].rename(columns=rename), use_container_width=True)
+    c1.dataframe(top[cols], use_container_width=True)
     c2.markdown("**Bottom-10**")
-    c2.dataframe(bottom[cols].rename(columns=rename), use_container_width=True)
+    c2.dataframe(bottom[cols], use_container_width=True)
 
 
 def draw_district_timeseries(
@@ -465,14 +557,53 @@ def draw_district_timeseries(
         labels={"quarter_dt": "quarter", "price_per_m2": "price_per_m2"},
         title=f"Динамика price_per_m2: {district_name}",
     )
-    fig.add_vline(x=parse_quarter(base_quarter).start_time, line_dash="dash", line_color="green")
-    fig.add_vline(x=parse_quarter(end_quarter).start_time, line_dash="dash", line_color="red")
+
+    selected_base = parse_quarter(base_quarter)
+    selected_end = parse_quarter(end_quarter)
+    if pd.notna(selected_base):
+        fig.add_vline(x=selected_base.start_time, line_dash="dash", line_color="green")
+    if pd.notna(selected_end):
+        fig.add_vline(x=selected_end.start_time, line_dash="dash", line_color="red")
+
+    if district_snapshot is not None:
+        eff_base_q = district_snapshot.get("effective_base_quarter")
+        eff_end_q = district_snapshot.get("effective_end_quarter")
+        eff_base = parse_quarter(eff_base_q)
+        eff_end = parse_quarter(eff_end_q)
+
+        marker_x = []
+        marker_y = []
+        marker_text = []
+        if pd.notna(eff_base) and pd.notna(district_snapshot.get("base_price")):
+            marker_x.append(eff_base.start_time)
+            marker_y.append(float(district_snapshot.get("base_price")))
+            marker_text.append("effective base")
+        if pd.notna(eff_end) and pd.notna(district_snapshot.get("current_price")):
+            marker_x.append(eff_end.start_time)
+            marker_y.append(float(district_snapshot.get("current_price")))
+            marker_text.append("effective end")
+
+        if marker_x:
+            fig.add_trace(
+                go.Scatter(
+                    x=marker_x,
+                    y=marker_y,
+                    mode="markers+text",
+                    text=marker_text,
+                    textposition="top center",
+                    marker={"size": 12, "symbol": "diamond", "color": "black"},
+                    name="effective points",
+                )
+            )
+
     st.plotly_chart(fig, use_container_width=True)
 
     if district_snapshot is not None:
         st.caption(
             " | ".join(
                 [
+                    f"Selected: {district_snapshot.get('selected_base_quarter')} → {district_snapshot.get('selected_end_quarter')}",
+                    f"Effective: {district_snapshot.get('effective_base_quarter')} → {district_snapshot.get('effective_end_quarter')}",
                     f"CAGR: {district_snapshot.get('cagr', np.nan):.2f}%",
                     f"Рост: {district_snapshot.get('pct_change', np.nan):.2f}%",
                     f"Абс. изменение: {district_snapshot.get('abs_change', np.nan):,.0f}",
@@ -484,7 +615,7 @@ def draw_district_timeseries(
 
 def main() -> None:
     st.set_page_config(page_title="Москва: цены на квартиры по районам (v2)", layout="wide")
-    st.title("Анализ цен на квартиры по районам Москвы — Interval v2")
+    st.title("Анализ цен на квартиры по районам Москвы — Interval v2.1")
 
     if not DATA_PATH.exists() or not GEOJSON_PATH.exists():
         st.error("Нужны два файла в корне проекта: panel.parquet и moscow_districts.geojson")
@@ -504,6 +635,12 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Параметры интервала")
+        quarter_mode = st.radio(
+            "Режим обработки кварталов",
+            options=list(QUARTER_MODE_OPTIONS.keys()),
+            format_func=lambda k: QUARTER_MODE_OPTIONS[k],
+            index=1,
+        )
         base_quarter = st.selectbox("Базовый квартал", quarter_options, index=default_base)
         end_quarter = st.selectbox("Конечный квартал", quarter_options, index=default_end)
         metric_key = st.selectbox(
@@ -519,7 +656,7 @@ def main() -> None:
         show_gray_unreliable = st.checkbox("Показывать районы без надежных данных серым", value=True)
 
     try:
-        snapshot, diagnostics, delta_q = build_interval_snapshot(
+        snapshot, diagnostics, selected_delta_q = build_interval_snapshot(
             df=panel,
             base_quarter=base_quarter,
             end_quarter=end_quarter,
@@ -527,6 +664,7 @@ def main() -> None:
             min_end_deals=int(min_end_deals),
             require_both_ends=require_both_ends,
             require_full_coverage=require_full_coverage,
+            quarter_mode=quarter_mode,
         )
     except ValueError as exc:
         st.error(str(exc))
@@ -548,11 +686,16 @@ def main() -> None:
     active_count = int(snapshot["has_reliable_data"].sum())
     draw_data_quality_summary(diagnostics, active_count)
 
-    st.info(
-        "CAGR считается как ((P_end / P_base)^(4 / delta_quarters) - 1) × 100. "
-        "coverage_ratio = observed_quarters / expected_quarters. "
-        "Серый цвет на карте означает отсутствие надежных данных для выбранного интервала."
-    )
+    if quarter_mode == "strict":
+        st.info(
+            "Strict mode: используются только точные совпадения quarter == selected quarter. "
+            "CAGR считается по выбранному интервалу только если обе точки существуют и effective end > effective base."
+        )
+    else:
+        st.info(
+            "Carry-forward mode: для каждого района берется последнее доступное наблюдение не позже выбранного квартала. "
+            "CAGR считается по фактическому effective interval между найденными effective quarter."
+        )
 
     map_gdf, warnings = build_map_frame(snapshot, gdf)
     for msg in warnings:
@@ -562,8 +705,6 @@ def main() -> None:
         map_gdf=map_gdf,
         selected_metric_col="metric_value",
         metric_label=metric_label,
-        base_quarter=base_quarter,
-        end_quarter=end_quarter,
         show_gray_unreliable=show_gray_unreliable,
     )
 
@@ -573,7 +714,7 @@ def main() -> None:
     district_options = sorted(snapshot["district_name"].dropna().unique().tolist())
     if not district_options:
         st.info("Нет районов для выбора в блоке временного ряда.")
-        st.caption(f"Интервал: {base_quarter} → {end_quarter} (Δ {delta_q} кварталов)")
+        st.caption(f"Selected интервал: {base_quarter} → {end_quarter} (Δ {selected_delta_q} кварталов)")
         return
     selected_district = st.selectbox("Район", options=district_options)
     district_row = snapshot[snapshot["district_name"] == selected_district]
@@ -586,7 +727,7 @@ def main() -> None:
         district_snapshot=district_snapshot,
     )
 
-    st.caption(f"Интервал: {base_quarter} → {end_quarter} (Δ {delta_q} кварталов)")
+    st.caption(f"Selected интервал: {base_quarter} → {end_quarter} (Δ {selected_delta_q} кварталов)")
 
 
 if __name__ == "__main__":
